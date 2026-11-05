@@ -1,6 +1,6 @@
 # Permafrost Vortex Extension
 
-Install by dropping `Permafrost Vortex Extension-1.0.5.zip` on Vortex's Extensions page, then restart Vortex. It is not installed from the Mods page.
+Install by dropping `Permafrost Vortex Extension-1.0.6.zip` on Vortex's Extensions page, then restart Vortex. It is not installed from the Mods page.
 
 Vortex decides where a Permafrost mod goes from the folder layout. There is no manifest. The readme is not parsed.
 
@@ -40,16 +40,21 @@ Do not ship `mods.txt` or `enabled.txt`. Vortex writes the one `mods.txt` line. 
 
 Do not use the basenames `Permafrost-Windows` or `global` for a pak, ucas, or utoc. Those files belong to the game.
 
-On the UE4SS page, a check writes `ModName : 1` and an uncheck writes `ModName : 0`. The folder stays either way. Each mod is its own bar. A checked mod has an up arrow, a down arrow, and a position menu from 1 through the number of checked mods. The arrows swap with the next checked row. The menu lifts that mod out and inserts it at the chosen number, including the script line of a mixed mod. Pak files are not reordered. An unchecked line stays where it is. Turning the mod off on the Mods page, uninstalling it, or purging removes the files and the line. `Keybinds` stays last.
+On the UE4SS page, a check writes `ModName : 1` and an uncheck writes `ModName : 0`. The folder stays either way. Each mod is its own bar. A checked mod has an up arrow, a down arrow, and a position menu from 1 through the number of checked mods. The arrows swap with the next checked row. The menu lifts that mod out and inserts it at the chosen number, including the script line of a mixed mod. Pak files are not reordered. An unchecked line stays where it is. Turning the mod off on the Mods page, uninstalling it, or purging removes the files and the line. `config.lua` and `Scripts\config.lua` are kept under `ue4ss\VortexSettings\<ModName>` and put back the next time that mod deploys. Deleting that saved folder is the clean reset. `Keybinds` stays last.
 
-Each time the game is managed, Vortex reads the UE4SS experimental-latest release and downloads the one zip whose name starts with `UE4SS_v3.0.1-`. The zip name is the build name. Vortex compares `dwmapi.dll` and `ue4ss\UE4SS.dll` in that zip with the files beside `Permafrost-Win64-Shipping.exe` and inside `Binaries\Win64\ue4ss`. A match is left alone. Anything else gets one question that names that build, and Yes confirms `Binaries\Win64` is writable first. A failed lookup, or a release that does not list exactly one of those zips, stops before the download and names the status or the files it found.
+Each time the game is managed, Vortex reads the UE4SS loader under the discovered game folder. It uses the ProductVersion on `Permafrost\Binaries\Win64\ue4ss\UE4SS.dll` and on `Permafrost\Binaries\Win64\UE4SS.dll`, and the directory names on that path. A version with a dash and a commit hash, such as `3.0.1-1208-gf6f8dc3cc`, or a version that is only a commit hash, such as `6f8dc3cc`, is experimental. An experimental install is left alone. There is no question and no download. A loader that is neither experimental nor stable 3.0.1 is left alone too. The UE4SS page shows that version and does not contact GitHub.
 
-- Nothing installed: Yes downloads the experimental archive into `Binaries\Win64\ue4ss`.
-- UE4SS 3.0.1 beside the exe: Yes removes that `UE4SS.dll`, replaces the proxy, and installs the experimental build into `ue4ss`. `Binaries\Win64\Mods` stays. Reinstall script mods so they deploy under `ue4ss\Mods`.
-- UE4SS 3.0.1, or any other build, already inside `ue4ss`: Yes replaces that loader. `mods.txt`, the settings ini, and installed mod folders stay.
-- The experimental build is in place and a second `UE4SS.dll` is still beside the exe: Yes removes that extra loader and does not download.
-- Some required file is missing, or the proxy is a different file: Yes fills the gaps and replaces a proxy that is not this build.
+The question is asked only when no `UE4SS.dll` is in either place, or when every loader that is present is stable 3.0.1. A proxy with no loader still counts as not installed. Yes downloads one pinned zip and checks its SHA-256 before anything is deleted or written:
 
-The experimental proxy loads `ue4ss\UE4SS.dll`. UE4SS reads `Mods` and the ini from that same `ue4ss` folder. Quit Permafrost before choosing Yes. Declining leaves the game unmoddable until that case is fixed. Reinstall a script mod after updating this extension. Deploy alone keeps the file list from the earlier install. When Vortex asks for a deploy path, and again during setup, the extension creates empty `Binaries\Win64\ue4ss\Mods`, `Content\Paks\LogicMods`, and game-folder `Mods` directories. Vortex treats a missing directory as not writable and then refuses Hardlink Deployment. `Binaries\Win64\Mods` stays where it is. Reinstall the ModLoader and any ModLoader DLL after updating this extension. Deploy alone keeps the `Content\Paks` file list from the earlier install.
+`https://github.com/paulyusy/UE4SS_v3.0.1-1208-g6f8dc3cc-Experimental/releases/download/UE4SS_v3.0.1-1208-g6f8dc3cc/UE4SS_v3.0.1-1208-g6f8dc3cc.zip`
+
+SHA-256 `899b6dbe84539c0b19d5ef08eb3a6e99e2195ebc0706baf24fe5799e3a6888f8`. A different hash is deleted and nothing is written. Setup confirms `Binaries\Win64` is writable before the question. Quit Permafrost before choosing Yes.
+
+- Nothing installed: Yes installs that build. `dwmapi.dll` lands beside the exe. The other files land in `Binaries\Win64\ue4ss`.
+- Stable 3.0.1 beside the exe: Yes removes that `UE4SS.dll` and installs the pinned build into `ue4ss`. `Binaries\Win64\Mods` and `Binaries\Win64\UE4SS-settings.ini` stay. Reinstall script mods so they deploy under `ue4ss\Mods`.
+- Stable 3.0.1 inside `ue4ss`: Yes replaces that loader and refreshes the built-in mod files from the zip, including their Lua. These stay when they already exist: `ue4ss\UE4SS-settings.ini`, `ue4ss\Mods\mods.txt`, `ue4ss\Mods\mods.json`, and `ue4ss\Mods\BPModLoaderMod\load_order.txt`. A mod folder the zip does not contain stays, including its `mods.txt` line.
+- No when nothing is installed stops setup. No when a stable 3.0.1 install is present keeps that install and setup finishes. The next setup asks again while it is still stable.
+
+The pinned proxy loads `ue4ss\UE4SS.dll`. UE4SS reads `Mods` and the ini from that same `ue4ss` folder. Reinstall a script mod after updating this extension. Deploy alone keeps the file list from the earlier install. When Vortex asks for a deploy path, and again during setup, the extension creates empty `Binaries\Win64\ue4ss\Mods`, `Content\Paks\LogicMods`, and game-folder `Mods` directories. Vortex treats a missing directory as not writable and then refuses Hardlink Deployment. `Binaries\Win64\Mods` stays where it is. Reinstall the ModLoader and any ModLoader DLL after updating this extension. Deploy alone keeps the `Content\Paks` file list from the earlier install.
 
 Released under the [MIT License](LICENSE). Copyright 2026 Paulyus.

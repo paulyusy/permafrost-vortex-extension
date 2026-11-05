@@ -44,6 +44,8 @@ const {
   testReject,
   prepareModLoader,
   removeDeployed,
+  preserveModConfig,
+  restoreModConfig,
   claimsHeldByOthers,
   dropModLine,
   listPakNames,
@@ -273,11 +275,28 @@ function reconcilePurged(api) {
   writeLogicOrder(projectRoot);
 }
 
+function restoreEnabledConfigs(api, profile, projectRoot) {
+  const modState = profile.modState || {};
+  for (const [modId, mod] of Object.entries(modsFor(api))) {
+    const folder = mod && mod.attributes && mod.attributes.ue4ssModFolder;
+    if (!folder) continue;
+    const id = (mod && mod.id) || modId;
+    if (!modState[id] || modState[id].enabled !== true) continue;
+    restoreModConfig(projectRoot, folder);
+  }
+}
+
 function onDeploy(api, profileId) {
   try {
     const profile = profileFor(api, profileId);
     if (!profile) return Promise.resolve();
     reconcileDeployed(api, profile);
+    try {
+      const projectRoot = projectRootFrom(api);
+      if (projectRoot && fs.existsSync(projectRoot)) restoreEnabledConfigs(api, profile, projectRoot);
+    } catch (err) {
+      log("error", "Permafrost config restore failed", err);
+    }
   } catch (err) {
     log("error", "Permafrost deploy cleanup failed", err);
     api.showErrorNotification("Permafrost could not update mods.txt", err, { allowReport: false });
@@ -776,6 +795,12 @@ async function onWillDeploy(api, profileId, lastDeployment) {
   if (!profile) return;
   const projectRoot = projectRootFrom(api);
   if (!projectRoot || !fs.existsSync(projectRoot)) return;
+  // Stash config.lua before the activator removes a disabled mod's files.
+  try {
+    stashDisabledConfigs(api, profile, projectRoot);
+  } catch (err) {
+    log("error", "Permafrost config stash failed", err);
+  }
   let incoming = [];
   let records = [];
   let onDisk = new Set();
@@ -837,6 +862,17 @@ async function onWillDeploy(api, profileId, lastDeployment) {
     return;
   }
   await removeIncomingMods(api, profileId, removeIds);
+}
+
+function stashDisabledConfigs(api, profile, projectRoot) {
+  const modState = profile.modState || {};
+  for (const [modId, mod] of Object.entries(modsFor(api))) {
+    const folder = mod && mod.attributes && mod.attributes.ue4ssModFolder;
+    if (!folder) continue;
+    const id = (mod && mod.id) || modId;
+    if (modState[id] && modState[id].enabled === true) continue;
+    preserveModConfig(projectRoot, folder);
+  }
 }
 
 function onRemove(api, gameId, modId) {
@@ -1001,19 +1037,12 @@ function Ue4ssPage(props) {
       setBuildLabel("Permafrost is not discovered yet.");
       return;
     }
-    let cancel = false;
-    setBuildLabel("checking the experimental release");
-    readInstalledBuildLabel(gamePath)
-      .then((label) => {
-        if (!cancel) setBuildLabel(label);
-      })
-      .catch((err) => {
-        log("warn", "Permafrost UE4SS version check failed", err);
-        if (!cancel) setBuildLabel("could not be read");
-      });
-    return () => {
-      cancel = true;
-    };
+    try {
+      setBuildLabel(readInstalledBuildLabel(gamePath));
+    } catch (err) {
+      log("warn", "Permafrost UE4SS version check failed", err);
+      setBuildLabel("could not be read");
+    }
   }, [api]);
 
   const checked = rows.filter((row) => row.ue4ssEnabled);
@@ -1138,7 +1167,7 @@ function Ue4ssPage(props) {
       null,
       "A checked mod is written as Name : 1. An unchecked mod is written as Name : 0 and the folder stays deployed. The arrows swap a checked mod with the next checked row. The position menu lifts it out and inserts it at that number. That includes the script line of a mixed mod. Pak files are not reordered. ",
       KEYBINDS_COMMENT,
-      " stays where it is, and Keybinds stays last. Turning a mod off on the Mods page removes its script folder, its recorded pak and text files, and its line.",
+      " stays where it is, and Keybinds stays last. Turning a mod off on the Mods page removes its script folder, its recorded pak and text files, and its line. config.lua and Scripts\\config.lua are copied to ue4ss\\VortexSettings\\ModName and written back the next time that mod deploys.",
     ),
     items,
   );

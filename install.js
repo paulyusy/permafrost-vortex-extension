@@ -864,6 +864,67 @@ function projectPaths(projectRoot) {
   };
 }
 
+const CONFIG_FILE = "config.lua";
+
+function configParts() {
+  return [[CONFIG_FILE], ["Scripts", CONFIG_FILE]];
+}
+
+function settingsDir(modsDir, folder) {
+  return path.join(path.dirname(modsDir), "VortexSettings", folder);
+}
+
+// Copy a live config.lua out of Mods before that folder is deleted. A missing
+// source does not replace a file already saved under VortexSettings.
+function preserveModConfig(projectRoot, folder) {
+  if (!folder || !isSafeSegment(folder)) return;
+  const modsDir = projectPaths(projectRoot).modsDir;
+  const stashRoot = settingsDir(modsDir, folder);
+  for (const parts of configParts()) {
+    const source = path.join(modsDir, folder, ...parts);
+    if (!fs.existsSync(source)) continue;
+    let stat;
+    try {
+      stat = fs.statSync(source);
+    } catch (err) {
+      if (err && (err.code === "ENOENT" || err.code === "ENOTDIR")) continue;
+      throw err;
+    }
+    if (!stat.isFile()) continue;
+    const dest = path.join(stashRoot, ...parts);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(source, dest);
+  }
+}
+
+// Write the saved config back over the deployed file, then drop the stash so
+// a later deploy does not freeze those settings.
+function restoreModConfig(projectRoot, folder) {
+  if (!folder || !isSafeSegment(folder)) return false;
+  const modsDir = projectPaths(projectRoot).modsDir;
+  const stashRoot = settingsDir(modsDir, folder);
+  if (!fs.existsSync(stashRoot)) return false;
+  let copied = false;
+  for (const parts of configParts()) {
+    const source = path.join(stashRoot, ...parts);
+    if (!fs.existsSync(source)) continue;
+    let stat;
+    try {
+      stat = fs.statSync(source);
+    } catch (err) {
+      if (err && (err.code === "ENOENT" || err.code === "ENOTDIR")) continue;
+      throw err;
+    }
+    if (!stat.isFile()) continue;
+    const dest = path.join(modsDir, folder, ...parts);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(source, dest);
+    copied = true;
+  }
+  if (copied) fs.rmSync(stashRoot, { recursive: true, force: true });
+  return copied;
+}
+
 // Walk from a directory that exists. Never stat a path whose parent is already gone.
 function existsUnder(root, target) {
   const base = path.resolve(root);
@@ -1021,6 +1082,7 @@ function removeDeployed(options) {
     if (options.ue4ssModFolder && isSafeSegment(options.ue4ssModFolder) && !keepFolder) {
       const folder = path.join(paths.modsDir, options.ue4ssModFolder);
       try {
+        preserveModConfig(projectRoot, options.ue4ssModFolder);
         clearVortexTags(root, folder);
         removeTree(root, folder, remove);
       } catch (err) {
@@ -1134,6 +1196,8 @@ module.exports = {
   prepareModLoader,
   installReject,
   removeDeployed,
+  preserveModConfig,
+  restoreModConfig,
   claimsHeldByOthers,
   dropModLine,
   existsUnder,

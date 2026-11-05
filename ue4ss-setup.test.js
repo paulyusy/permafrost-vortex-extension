@@ -1,4 +1,4 @@
-const { describe, it, beforeEach } = require("node:test");
+const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -6,7 +6,9 @@ const os = require("os");
 const path = require("path");
 const zlib = require("zlib");
 const {
-  RELEASES_API_URL,
+  PINNED_URL,
+  PINNED_ZIP_SHA256,
+  PINNED_LABEL,
   RELEASE_LOADER_SHA256,
   RELEASE_PROXY_SHA256,
   diagnose,
@@ -16,10 +18,12 @@ const {
   extractMissing,
   inspectLayout,
   identitiesFromZip,
-  labelFromAssetName,
-  pickExperimentalAsset,
   readInstalledBuildLabel,
-  clearPublishedBuild,
+  readProductVersion,
+  readLoaders,
+  experimentalToken,
+  classifyLoaders,
+  productVersionInZip,
 } = require("./ue4ss-setup");
 
 function crc32(buffer) {
@@ -99,6 +103,12 @@ const BUILT = {
   otherLoader: "some-other-ue4ss",
 };
 
+function versioned(payload, productVersion) {
+  const key = Buffer.from("ProductVersion\0", "utf16le");
+  const value = Buffer.from(productVersion + "\0", "utf16le");
+  return Buffer.concat([Buffer.from(payload), key, value]);
+}
+
 function testIdentities() {
   return {
     currentProxy: sha(BUILT.proxy),
@@ -135,7 +145,11 @@ function experimentalZip(dir) {
       { name: "ue4ss/UE4SS.dll", data: BUILT.loader, deflate: true },
       { name: "ue4ss/UE4SS-settings.ini", data: BUILT.ini },
       { name: "ue4ss/Mods/mods.txt", data: "stock-list" },
+      { name: "ue4ss/Mods/mods.json", data: "stock-json" },
+      { name: "ue4ss/Mods/BPModLoaderMod/load_order.txt", data: "stock-order" },
+      { name: "ue4ss/Mods/BPModLoaderMod/Scripts/main.lua", data: "new-bpml" },
       { name: "ue4ss/Mods/CheatManagerEnablerMod/Scripts/main.lua", data: "return {}" },
+      { name: "ue4ss/Mods/shared/UEHelpers/UEHelpers.lua", data: "return {}\n" },
     ]),
   );
   return zipPath;
@@ -146,6 +160,21 @@ function yesApi(seen) {
     showDialog: (_type, _title, body) => {
       seen.texts.push(body.text);
       return Promise.resolve({ action: "Yes" });
+    },
+  };
+}
+
+function acceptedZip(gamePath) {
+  const zipPath = experimentalZip(gamePath);
+  return {
+    zipPath,
+    options: {
+      download: (url) => {
+        assert.equal(url, PINNED_URL);
+        return zipPath;
+      },
+      zipSha256: sha(fs.readFileSync(zipPath)),
+      cleanupDownload: true,
     },
   };
 }
@@ -318,129 +347,361 @@ describe("UE4SS layout", () => {
   });
 });
 
-describe("UE4SS setup", () => {
-  it("leaves a current install alone", async () => {
-    const { gamePath, win64 } = gameTree();
-    writeCurrent(win64);
-    let asked = 0;
-    const result = await ensureUe4ss(gamePath, {
-      showDialog: () => { asked += 1; },
-    }, {
-      identities: testIdentities(),
-      download: () => { throw new Error("download"); },
+function quietApi() {
+  return {
+    asked: 0,
+    downloaded: 0,
+    api: {
+      showDialog: () => {
+        throw new Error("asked");
+      },
+    },
+    options: {
+      download: () => {
+        throw new Error("download");
+      },
+    },
+  };
+}
+
+describe("UE4SS version gate", () => {
+  it("reads a ProductVersion placed after the key, including a short pad", () => {
+    assert.equal(readProductVersion(versioned("dll", "6f8dc3cc")), "6f8dc3cc");
+    assert.equal(readProductVersion(versioned("dll", "3.0.1")), "3.0.1");
+    const key = Buffer.from("ProductVersion\0", "utf16le");
+    const value = Buffer.from("3.0.1.0\0", "utf16le");
+    const padded = Buffer.concat([Buffer.from("x"), key, Buffer.from([0, 0]), value]);
+    assert.equal(readProductVersion(padded), "3.0.1.0");
+    assert.equal(readProductVersion(Buffer.from("nope")), "");
+    assert.equal(experimentalToken("3.0.1-1208-gf6f8dc3cc"), "3.0.1-1208-gf6f8dc3cc");
+    assert.equal(experimentalToken("UE4SS_v3.0.1-1181-g83330635"), "3.0.1-1181-g83330635");
+    assert.equal(experimentalToken("6f8dc3cc"), "6f8dc3cc");
+    assert.equal(experimentalToken("3.0.1"), null);
+    assert.equal(experimentalToken("0.0.0.0"), null);
+  });
+
+  it("stays quiet for an experimental hash, a versioned folder, or an unrecognized loader", () => {
+    const experimental = classifyLoaders({
+      nested: { present: true, productVersion: "6f8dc3cc", dirNames: ["ue4ss"], hash: "abc" },
+      flat: { present: true, productVersion: "3.0.1", dirNames: [], hash: RELEASE_LOADER_SHA256 },
     });
-    assert.equal(asked, 0);
-    assert.equal(result.id, "current");
-    fs.rmSync(gamePath, { recursive: true, force: true });
+    assert.equal(experimental.action, "quiet");
+    assert.equal(experimental.id, "experimental");
+    assert.equal(experimental.token, "6f8dc3cc");
+
+    const folder = classifyLoaders({
+      nested: {
+        present: true,
+        productVersion: "",
+        dirNames: ["Permafrost", "UE4SS_v3.0.1-1181-g83330635"],
+        hash: "abc",
+      },
+      flat: { present: false },
+    });
+    assert.equal(folder.action, "quiet");
+    assert.equal(folder.token, "3.0.1-1181-g83330635");
+
+    const other = classifyLoaders({
+      nested: { present: true, productVersion: "", dirNames: ["ue4ss"], hash: "abc" },
+      flat: { present: false },
+    });
+    assert.equal(other.action, "quiet");
+    assert.equal(other.id, "other");
+
+    const proxyVersion = classifyLoaders({
+      nested: { present: true, productVersion: "0.0.0.0", dirNames: [], hash: "abc" },
+      flat: { present: false },
+    });
+    assert.equal(proxyVersion.action, "quiet");
+    assert.equal(proxyVersion.id, "other");
+  });
+
+  it("asks for a dotted stable version or a stored 3.0.1 hash", () => {
+    const dotted = classifyLoaders({
+      nested: { present: true, productVersion: "3.0.1", dirNames: ["ue4ss"], hash: "abc" },
+      flat: { present: false },
+    });
+    assert.equal(dotted.action, "ask");
+    assert.equal(dotted.id, "release-nested");
+
+    const dottedFlat = classifyLoaders({
+      nested: { present: false },
+      flat: { present: true, productVersion: "3.0.1.0", dirNames: [], hash: "abc" },
+    });
+    assert.equal(dottedFlat.id, "release-flat");
+
+    const hashed = classifyLoaders({
+      nested: { present: true, productVersion: "", dirNames: ["ue4ss"], hash: RELEASE_LOADER_SHA256 },
+      flat: { present: true, productVersion: "", dirNames: [], hash: RELEASE_PROXY_SHA256 },
+    });
+    assert.equal(hashed.action, "ask");
+    assert.equal(hashed.id, "release-nested");
+    assert.equal(hashed.flat, "stable");
+
+    const missing = classifyLoaders({
+      nested: { present: false },
+      flat: { present: false },
+    });
+    assert.equal(missing.action, "ask");
+    assert.equal(missing.id, "missing");
+  });
+});
+
+describe("UE4SS setup", () => {
+  it("leaves an experimental ProductVersion alone", async () => {
+    const { gamePath, win64 } = gameTree();
+    try {
+      const loader = path.join(win64, "ue4ss", "UE4SS.dll");
+      fs.mkdirSync(path.dirname(loader), { recursive: true });
+      fs.writeFileSync(loader, versioned(BUILT.loader, "6f8dc3cc"));
+      fs.writeFileSync(path.join(win64, "UE4SS.dll"), "extra-loader");
+      const gate = quietApi();
+      const result = await ensureUe4ss(gamePath, gate.api, gate.options);
+      assert.equal(result.asked, false);
+      assert.equal(result.id, "experimental");
+      assert.equal(readInstalledBuildLabel(gamePath), "experimental 6f8dc3cc");
+      assert.equal(fs.readFileSync(path.join(win64, "UE4SS.dll"), "utf8"), "extra-loader");
+      assert.deepEqual(readLoaders(gamePath).nested.dirNames, ["Permafrost", "Binaries", "Win64", "ue4ss"]);
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves a versioned folder and an unrecognized loader alone", async () => {
+    const { gamePath, win64 } = gameTree();
+    try {
+      const folderLabel = readInstalledBuildLabel(gamePath, {
+        loaders: {
+          nested: {
+            present: true,
+            productVersion: "",
+            dirNames: ["UE4SS_v3.0.1-1181-g83330635"],
+            hash: "abc",
+          },
+          flat: { present: false },
+        },
+      });
+      assert.equal(folderLabel, "experimental 3.0.1-1181-g83330635");
+      const gate = quietApi();
+      const quiet = await ensureUe4ss(gamePath, gate.api, {
+        loaders: {
+          nested: {
+            present: true,
+            productVersion: "",
+            dirNames: ["UE4SS_v3.0.1-1181-g83330635"],
+            hash: "abc",
+          },
+          flat: { present: false },
+        },
+        download: gate.options.download,
+      });
+      assert.equal(quiet.asked, false);
+      assert.equal(quiet.id, "experimental");
+
+      writeCurrent(win64);
+      fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), BUILT.otherLoader);
+      let asked = 0;
+      const result = await ensureUe4ss(gamePath, {
+        showDialog: () => {
+          asked += 1;
+          return Promise.resolve({ action: "Yes" });
+        },
+      }, {
+        download: () => {
+          throw new Error("download");
+        },
+      });
+      assert.equal(asked, 0);
+      assert.equal(result.id, "other");
+      assert.equal(readInstalledBuildLabel(gamePath), "unrecognized build");
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.otherLoader);
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "utf8"), "player-list");
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
   });
 
   it("asks with the missing-install text, and No writes nothing", async () => {
     const { gamePath, win64 } = gameTree();
-    await assert.rejects(
-      () => ensureUe4ss(gamePath, {
-        showDialog: (_type, _title, body) => {
-          assert.match(body.text, /is not installed/);
-          assert.ok(body.text.includes(LABEL));
+    try {
+      fs.writeFileSync(path.join(win64, "dwmapi.dll"), versioned("proxy", "0.0.0.0"));
+      let downloaded = 0;
+      await assert.rejects(
+        () => ensureUe4ss(gamePath, {
+          showDialog: (_type, _title, body) => {
+            assert.match(body.text, /is not installed/);
+            assert.ok(body.text.includes(PINNED_LABEL));
+            return Promise.resolve({ action: "No" });
+          },
+        }, {
+          download: () => {
+            downloaded += 1;
+            throw new Error("download");
+          },
+        }),
+        (err) => err.code === "UE4SS_DECLINED",
+      );
+      assert.equal(downloaded, 0);
+      assert.equal(readInstalledBuildLabel(gamePath), "not installed");
+      assert.equal(fs.existsSync(path.join(win64, "ue4ss")), false);
+      assert.equal(fs.readFileSync(path.join(win64, "dwmapi.dll"), "utf8").includes("proxy"), true);
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a stable install when the answer is No", async () => {
+    const { gamePath, win64 } = gameTree();
+    try {
+      const loader = path.join(win64, "ue4ss", "UE4SS.dll");
+      const body = versioned(BUILT.releaseLoader, "3.0.1");
+      fs.mkdirSync(path.dirname(loader), { recursive: true });
+      fs.writeFileSync(loader, body);
+      let downloaded = 0;
+      const result = await ensureUe4ss(gamePath, {
+        showDialog: (_type, _title, dialog) => {
+          assert.match(dialog.text, /inside Binaries\\Win64\\ue4ss/);
           return Promise.resolve({ action: "No" });
         },
       }, {
-        identities: testIdentities(),
-        label: LABEL,
-        download: () => { throw new Error("download"); },
-      }),
-      (err) => err.code === "UE4SS_DECLINED",
-    );
-    assert.equal(fs.existsSync(path.join(win64, "dwmapi.dll")), false);
-    assert.equal(fs.existsSync(path.join(win64, "ue4ss")), false);
-    fs.rmSync(gamePath, { recursive: true, force: true });
+        download: () => {
+          downloaded += 1;
+          throw new Error("download");
+        },
+      });
+      assert.equal(downloaded, 0);
+      assert.deepEqual(result, { asked: true, declined: true, id: "release-nested", removed: [] });
+      assert.equal(readInstalledBuildLabel(gamePath), "3.0.1");
+      assert.deepEqual(fs.readFileSync(loader), body);
+
+      const hashed = await ensureUe4ss(gamePath, {
+        showDialog: () => Promise.resolve({ action: "No" }),
+      }, {
+        loaders: {
+          nested: { present: true, productVersion: "", dirNames: [], hash: RELEASE_LOADER_SHA256 },
+          flat: { present: false },
+        },
+        download: () => {
+          downloaded += 1;
+          throw new Error("download");
+        },
+      });
+      assert.equal(downloaded, 0);
+      assert.equal(hashed.declined, true);
+      assert.equal(hashed.id, "release-nested");
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing when the zip hash differs", async () => {
+    const { gamePath, win64 } = gameTree();
+    try {
+      const loader = path.join(win64, "ue4ss", "UE4SS.dll");
+      const body = versioned(BUILT.releaseLoader, "3.0.1");
+      fs.mkdirSync(path.dirname(loader), { recursive: true });
+      fs.writeFileSync(loader, body);
+      const zipPath = experimentalZip(gamePath);
+      await assert.rejects(
+        () => ensureUe4ss(gamePath, yesApi({ texts: [] }), {
+          download: (url) => {
+            assert.equal(url, PINNED_URL);
+            return zipPath;
+          },
+          zipSha256: "0123456789abcdef".repeat(4),
+          cleanupDownload: false,
+        }),
+        /hash did not match/,
+      );
+      assert.equal(fs.existsSync(zipPath), false);
+      assert.deepEqual(fs.readFileSync(loader), body);
+      assert.equal(fs.existsSync(path.join(win64, "dwmapi.dll")), false);
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
   });
 
   it("switches a flat 3.0.1 install and keeps both mods lists", async () => {
     const { gamePath, win64 } = gameTree();
-    fs.writeFileSync(path.join(win64, "dwmapi.dll"), BUILT.releaseProxy);
-    fs.writeFileSync(path.join(win64, "UE4SS.dll"), BUILT.releaseLoader);
-    fs.writeFileSync(path.join(win64, "UE4SS-settings.ini"), "flat-settings");
-    fs.mkdirSync(path.join(win64, "Mods"), { recursive: true });
-    fs.writeFileSync(path.join(win64, "Mods", "mods.txt"), "flat-list");
-    fs.mkdirSync(path.join(win64, "ue4ss", "Mods"), { recursive: true });
-    fs.writeFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "player-list");
-    const seen = { texts: [] };
-    const result = await ensureUe4ss(gamePath, yesApi(seen), {
-      identities: testIdentities(),
-      download: () => experimentalZip(gamePath),
-    });
-    assert.equal(result.id, "release-flat");
-    assert.match(seen.texts[0], /beside the exe/);
-    assert.equal(fs.existsSync(path.join(win64, "UE4SS.dll")), false);
-    assert.equal(fs.readFileSync(path.join(win64, "dwmapi.dll"), "utf8"), BUILT.proxy);
-    assert.equal(fs.readFileSync(path.join(win64, "UE4SS-settings.ini"), "utf8"), "flat-settings");
-    assert.equal(fs.readFileSync(path.join(win64, "Mods", "mods.txt"), "utf8"), "flat-list");
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS-settings.ini"), "utf8"), BUILT.ini);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "utf8"), "player-list");
-    assert.equal(
-      fs.readFileSync(path.join(win64, "ue4ss", "Mods", "CheatManagerEnablerMod", "Scripts", "main.lua"), "utf8"),
-      "return {}",
-    );
-    fs.rmSync(gamePath, { recursive: true, force: true });
+    try {
+      fs.writeFileSync(path.join(win64, "dwmapi.dll"), BUILT.releaseProxy);
+      fs.writeFileSync(path.join(win64, "UE4SS.dll"), versioned(BUILT.releaseLoader, "3.0.1"));
+      fs.writeFileSync(path.join(win64, "UE4SS-settings.ini"), "flat-settings");
+      fs.mkdirSync(path.join(win64, "Mods"), { recursive: true });
+      fs.writeFileSync(path.join(win64, "Mods", "mods.txt"), "flat-list");
+      fs.mkdirSync(path.join(win64, "ue4ss", "Mods"), { recursive: true });
+      fs.writeFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "player-list");
+      const seen = { texts: [] };
+      const packed = acceptedZip(gamePath);
+      const result = await ensureUe4ss(gamePath, yesApi(seen), packed.options);
+      assert.equal(result.id, "release-flat");
+      assert.match(seen.texts[0], /beside the exe/);
+      assert.equal(fs.existsSync(path.join(win64, "UE4SS.dll")), false);
+      assert.equal(fs.readFileSync(path.join(win64, "dwmapi.dll"), "utf8"), BUILT.proxy);
+      assert.equal(fs.readFileSync(path.join(win64, "UE4SS-settings.ini"), "utf8"), "flat-settings");
+      assert.equal(fs.readFileSync(path.join(win64, "Mods", "mods.txt"), "utf8"), "flat-list");
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS-settings.ini"), "utf8"), BUILT.ini);
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "utf8"), "player-list");
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.json"), "utf8"), "stock-json");
+      assert.equal(
+        fs.readFileSync(path.join(win64, "ue4ss", "Mods", "BPModLoaderMod", "load_order.txt"), "utf8"),
+        "stock-order",
+      );
+      assert.equal(
+        fs.readFileSync(path.join(win64, "ue4ss", "Mods", "CheatManagerEnablerMod", "Scripts", "main.lua"), "utf8"),
+        "return {}",
+      );
+      assert.equal(fs.existsSync(packed.zipPath), false);
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
   });
 
-  it("replaces a 3.0.1 loader inside ue4ss and keeps mods.txt", async () => {
+  it("refreshes built-in files and keeps the saved lists and a player folder", async () => {
     const { gamePath, win64 } = gameTree();
-    writeCurrent(win64);
-    fs.writeFileSync(path.join(win64, "dwmapi.dll"), BUILT.releaseProxy);
-    fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), BUILT.releaseLoader);
-    fs.writeFileSync(path.join(win64, "UE4SS.dll"), BUILT.releaseLoader);
-    const seen = { texts: [] };
-    const result = await ensureUe4ss(gamePath, yesApi(seen), {
-      identities: testIdentities(),
-      download: () => experimentalZip(gamePath),
-    });
-    assert.equal(result.id, "release-nested");
-    assert.match(seen.texts[0], /inside Binaries\\Win64\\ue4ss/);
-    assert.equal(fs.existsSync(path.join(win64, "UE4SS.dll")), false);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "utf8"), "player-list");
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS-settings.ini"), "utf8"), BUILT.ini);
-    fs.rmSync(gamePath, { recursive: true, force: true });
-  });
-
-  it("updates a loader that is neither 3.0.1 nor the pinned build", async () => {
-    const { gamePath, win64 } = gameTree();
-    writeCurrent(win64);
-    fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), BUILT.otherLoader);
-    const seen = { texts: [] };
-    const result = await ensureUe4ss(gamePath, yesApi(seen), {
-      identities: testIdentities(),
-      download: () => experimentalZip(gamePath),
-    });
-    assert.equal(result.id, "stale");
-    assert.equal(fs.readFileSync(path.join(win64, "dwmapi.dll"), "utf8"), BUILT.proxy);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "Mods", "mods.txt"), "utf8"), "player-list");
-    assert.match(seen.texts[0], /Update|Replace the loader/);
-    fs.rmSync(gamePath, { recursive: true, force: true });
-  });
-
-  it("removes a leftover flat loader without downloading", async () => {
-    const { gamePath, win64 } = gameTree();
-    writeCurrent(win64);
-    fs.writeFileSync(path.join(win64, "UE4SS.dll"), "extra-loader");
-    let downloaded = 0;
-    const result = await ensureUe4ss(gamePath, {
-      showDialog: () => Promise.resolve({ action: "Yes" }),
-    }, {
-      identities: testIdentities(),
-      download: () => {
-        downloaded += 1;
-        throw new Error("download");
-      },
-    });
-    assert.equal(downloaded, 0);
-    assert.equal(result.id, "leftover-flat");
-    assert.equal(fs.existsSync(path.join(win64, "UE4SS.dll")), false);
-    assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
-    fs.rmSync(gamePath, { recursive: true, force: true });
+    try {
+      writeCurrent(win64);
+      const loader = path.join(win64, "ue4ss", "UE4SS.dll");
+      fs.writeFileSync(loader, versioned(BUILT.releaseLoader, "3.0.1"));
+      fs.writeFileSync(path.join(win64, "UE4SS.dll"), versioned(BUILT.releaseLoader, "3.0.1"));
+      fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS-settings.ini"), "player-settings");
+      const mods = path.join(win64, "ue4ss", "Mods");
+      fs.writeFileSync(path.join(mods, "mods.txt"), "player-list");
+      fs.writeFileSync(path.join(mods, "mods.json"), "player-json");
+      const bp = path.join(mods, "BPModLoaderMod");
+      fs.mkdirSync(path.join(bp, "Scripts"), { recursive: true });
+      fs.writeFileSync(path.join(bp, "load_order.txt"), "player-order");
+      fs.writeFileSync(path.join(bp, "Scripts", "main.lua"), "old-bpml");
+      fs.writeFileSync(path.join(bp, "Scripts", "obsolete.lua"), "gone");
+      const shared = path.join(mods, "shared", "UEHelpers");
+      fs.mkdirSync(shared, { recursive: true });
+      fs.writeFileSync(path.join(shared, "old.lua"), "gone");
+      const player = path.join(mods, "PlayerMod");
+      fs.mkdirSync(path.join(player, "Scripts"), { recursive: true });
+      fs.writeFileSync(path.join(player, "Scripts", "main.lua"), "player");
+      fs.writeFileSync(path.join(player, "config.lua"), "keep-me");
+      const seen = { texts: [] };
+      assert.equal(readInstalledBuildLabel(gamePath), "3.0.1, plus 3.0.1 beside the exe");
+      const result = await ensureUe4ss(gamePath, yesApi(seen), acceptedZip(gamePath).options);
+      assert.equal(result.id, "release-nested");
+      assert.match(seen.texts[0], /inside Binaries\\Win64\\ue4ss/);
+      assert.equal(fs.existsSync(path.join(win64, "dwmapi.dll")), true);
+      assert.equal(fs.existsSync(path.join(win64, "UE4SS.dll")), false);
+      assert.equal(fs.readFileSync(loader, "utf8"), BUILT.loader);
+      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS-settings.ini"), "utf8"), "player-settings");
+      assert.equal(fs.readFileSync(path.join(mods, "mods.txt"), "utf8"), "player-list");
+      assert.equal(fs.readFileSync(path.join(mods, "mods.json"), "utf8"), "player-json");
+      assert.equal(fs.readFileSync(path.join(bp, "load_order.txt"), "utf8"), "player-order");
+      assert.equal(fs.readFileSync(path.join(bp, "Scripts", "main.lua"), "utf8"), "new-bpml");
+      assert.equal(fs.existsSync(path.join(bp, "Scripts", "obsolete.lua")), false);
+      assert.equal(fs.readFileSync(path.join(shared, "UEHelpers.lua"), "utf8"), "return {}\n");
+      assert.equal(fs.existsSync(path.join(shared, "old.lua")), false);
+      assert.equal(fs.readFileSync(path.join(player, "Scripts", "main.lua"), "utf8"), "player");
+      assert.equal(fs.readFileSync(path.join(player, "config.lua"), "utf8"), "keep-me");
+    } finally {
+      fs.rmSync(gamePath, { recursive: true, force: true });
+    }
   });
 });
 
@@ -478,62 +739,8 @@ describe("experimental UE4SS zip", () => {
   });
 });
 
-function jsonResponse(body, status = 200) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    json: async () => body,
-  };
-}
 
-function publishedAssets(name, url) {
-  return [
-    { name: "zDEV-UE4SS_v3.0.1-1183-gcdbc0b66.zip", browser_download_url: "https://example.invalid/dev.zip" },
-    { name, browser_download_url: url },
-    { name: "zCustomGameConfigs.zip", browser_download_url: "https://example.invalid/cfg.zip" },
-    { name: "zMapGenBP.zip", browser_download_url: "https://example.invalid/map.zip" },
-  ];
-}
-
-describe("published experimental release", { concurrency: 1 }, () => {
-  beforeEach(() => clearPublishedBuild());
-
-  it("picks the one UE4SS_v3.0.1 zip and names the build from that file", () => {
-    const picked = pickExperimentalAsset({
-      assets: publishedAssets("UE4SS_v3.0.1-1183-gcdbc0b66.zip", "https://example.invalid/current.zip"),
-    });
-    assert.equal(picked.name, "UE4SS_v3.0.1-1183-gcdbc0b66.zip");
-    assert.equal(picked.url, "https://example.invalid/current.zip");
-    assert.equal(picked.label, LABEL);
-    assert.equal(labelFromAssetName(picked.name), LABEL);
-    assert.throws(
-      () => pickExperimentalAsset({
-        assets: [
-          { name: "zDEV-UE4SS_v3.0.1-1183-gcdbc0b66.zip", browser_download_url: "https://example.invalid/dev.zip" },
-          { name: "zMapGenBP.zip", browser_download_url: "https://example.invalid/map.zip" },
-        ],
-      }),
-      /listed 0 archives named UE4SS_v3\.0\.1-\*\.zip \(zDEV-UE4SS_v3\.0\.1-1183-gcdbc0b66\.zip, zMapGenBP\.zip\)/,
-    );
-    assert.throws(
-      () => pickExperimentalAsset({
-        assets: [
-          { name: "UE4SS_v3.0.1-1-ga.zip", browser_download_url: "https://example.invalid/1.zip" },
-          { name: "UE4SS_v3.0.1-2-gb.zip", browser_download_url: "https://example.invalid/2.zip" },
-        ],
-      }),
-      /listed 2 archives named UE4SS_v3\.0\.1-\*\.zip \(UE4SS_v3\.0\.1-1-ga\.zip, UE4SS_v3\.0\.1-2-gb\.zip\)/,
-    );
-    assert.throws(
-      () => pickExperimentalAsset({ assets: [{ name: "UE4SS_v3.0.1-1183-gcdbc0b66.zip" }] }),
-      /no download URL \(UE4SS_v3\.0\.1-1183-gcdbc0b66\.zip\)/,
-    );
-    assert.throws(
-      () => pickExperimentalAsset(null),
-      /listed 0 archives named UE4SS_v3\.0\.1-\*\.zip \(none\)/,
-    );
-  });
-
+describe("zip identities", () => {
   it("reads the proxy and nested loader from the zip and ignores a root loader", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pm-ue4ss-zip-"));
     try {
@@ -550,201 +757,28 @@ describe("published experimental release", { concurrency: 1 }, () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+});
 
-  it("stops before the download when the release lookup fails or the asset list is wrong", async () => {
-    const cases = [
-      {
-        fetchRelease: async () => jsonResponse({}, 404),
-        pattern: /release lookup failed \(404\)/,
-      },
-      {
-        fetchRelease: async () => { throw new Error("offline"); },
-        pattern: /release lookup failed \(offline\)/,
-      },
-      {
-        fetchRelease: async () => ({ ok: true, status: 200, json: async () => { throw new Error("nope"); } }),
-        pattern: /invalid JSON/,
-      },
-      {
-        fetchRelease: async () => jsonResponse({
-          assets: [
-            { name: "zDEV-UE4SS_v3.0.1-1183-gcdbc0b66.zip", browser_download_url: "https://example.invalid/dev.zip" },
-            { name: "zMapGenBP.zip", browser_download_url: "https://example.invalid/map.zip" },
-          ],
-        }),
-        pattern: /listed 0 archives named UE4SS_v3\.0\.1-\*\.zip \(zDEV-UE4SS_v3\.0\.1-1183-gcdbc0b66\.zip, zMapGenBP\.zip\)/,
-      },
-      {
-        fetchRelease: async () => jsonResponse({
-          assets: [
-            { name: "UE4SS_v3.0.1-1-ga.zip", browser_download_url: "https://example.invalid/1.zip" },
-            { name: "UE4SS_v3.0.1-2-gb.zip", browser_download_url: "https://example.invalid/2.zip" },
-          ],
-        }),
-        pattern: /listed 2 archives/,
-      },
-      {
-        fetchRelease: async () => jsonResponse({
-          assets: [{ name: "UE4SS_v3.0.1-1183-gcdbc0b66.zip" }],
-        }),
-        pattern: /no download URL/,
-      },
-    ];
-    for (const item of cases) {
-      clearPublishedBuild();
-      const { gamePath } = gameTree();
-      let downloads = 0;
-      try {
-        await assert.rejects(
-          () => ensureUe4ss(gamePath, {
-            showDialog: () => { throw new Error("asked"); },
-          }, {
-            fetchRelease: item.fetchRelease,
-            download: () => {
-              downloads += 1;
-              throw new Error("download");
-            },
-            cleanupDownload: true,
-          }),
-          item.pattern,
-        );
-        assert.equal(downloads, 0);
-      } finally {
-        clearPublishedBuild();
-        fs.rmSync(gamePath, { recursive: true, force: true });
-      }
+describe("pinned local zips", () => {
+  const zip1208 = "C:/Users/Paulyus/Documents/My Games/Permafrost/UE4SS Experimental/UE4SS_v3.0.1-1208-g6f8dc3cc.zip";
+  const zip1181 = "C:/Users/Paulyus/Downloads/PERMAFROST/MODS/UE4SS_v3.0.1-1181/UE4SS_v3.0.1-1181-g83330635.zip";
+
+  it("matches the pinned zip hash and reads ProductVersion 6f8dc3cc", (t) => {
+    if (!fs.existsSync(zip1208)) {
+      t.skip("pinned zip is not on disk");
+      return;
     }
+    assert.equal(sha(fs.readFileSync(zip1208)), PINNED_ZIP_SHA256);
+    assert.equal(productVersionInZip(zip1208), "6f8dc3cc");
   });
 
-  it("leaves a disk install that matches the published zip and shares that label", async () => {
-    const { gamePath, win64 } = gameTree();
-    let downloads = 0;
-    try {
-      writeCurrent(win64);
-      const fetchRelease = async (url, init) => {
-        assert.equal(url, RELEASES_API_URL);
-        assert.equal(init.headers.Accept, "application/vnd.github+json");
-        assert.equal(init.headers["User-Agent"], "permafrost-vortex");
-        return jsonResponse({
-          assets: publishedAssets("UE4SS_v3.0.1-1183-gcdbc0b66.zip", "https://example.invalid/current.zip"),
-        });
-      };
-      const download = (url) => {
-        downloads += 1;
-        assert.equal(url, "https://example.invalid/current.zip");
-        return experimentalZip(gamePath);
-      };
-      const result = await ensureUe4ss(gamePath, {
-        showDialog: () => { throw new Error("asked"); },
-      }, {
-        fetchRelease,
-        download,
-        cleanupDownload: true,
-      });
-      assert.equal(result.asked, false);
-      assert.equal(result.id, "current");
-      assert.equal(downloads, 1);
-      assert.equal(fs.existsSync(path.join(gamePath, "experimental.zip")), false);
-      const label = await readInstalledBuildLabel(gamePath, {
-        fetchRelease,
-        download: () => {
-          downloads += 1;
-          throw new Error("second download");
-        },
-      });
-      assert.equal(label, "experimental " + LABEL);
-      assert.equal(downloads, 1);
-    } finally {
-      clearPublishedBuild();
-      fs.rmSync(gamePath, { recursive: true, force: true });
+  it("does not treat the 1181 loader version as a stable release", (t) => {
+    if (!fs.existsSync(zip1181)) {
+      t.skip("1181 zip is not on disk");
+      return;
     }
-  });
-
-  it("asks with the published name and extracts that zip once when the disk differs", async () => {
-    const { gamePath, win64 } = gameTree();
-    let downloads = 0;
-    try {
-      writeCurrent(win64);
-      fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), BUILT.otherLoader);
-      const seen = { texts: [] };
-      const result = await ensureUe4ss(gamePath, yesApi(seen), {
-        fetchRelease: async () => jsonResponse({
-          assets: publishedAssets("UE4SS_v3.0.1-1183-gcdbc0b66.zip", "https://example.invalid/current.zip"),
-        }),
-        download: (url) => {
-          downloads += 1;
-          assert.equal(url, "https://example.invalid/current.zip");
-          return experimentalZip(gamePath);
-        },
-        cleanupDownload: true,
-      });
-      assert.equal(downloads, 1);
-      assert.equal(result.id, "stale");
-      assert.ok(seen.texts[0].includes(LABEL));
-      assert.equal(fs.readFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), "utf8"), BUILT.loader);
-      assert.equal(fs.readFileSync(path.join(win64, "dwmapi.dll"), "utf8"), BUILT.proxy);
-      const label = await readInstalledBuildLabel(gamePath, {
-        fetchRelease: async () => jsonResponse({
-          assets: publishedAssets("UE4SS_v3.0.1-1183-gcdbc0b66.zip", "https://example.invalid/current.zip"),
-        }),
-        download: () => {
-          downloads += 1;
-          throw new Error("second download");
-        },
-      });
-      assert.equal(label, "experimental " + LABEL);
-      assert.equal(downloads, 1);
-    } finally {
-      clearPublishedBuild();
-      fs.rmSync(gamePath, { recursive: true, force: true });
-    }
-  });
-
-  it("downloads again when experimental-latest lists a new zip name", async () => {
-    const { gamePath, win64 } = gameTree();
-    let downloads = 0;
-    let name = "UE4SS_v3.0.1-1183-gcdbc0b66.zip";
-    try {
-      writeCurrent(win64);
-      const fetchRelease = async () => jsonResponse({
-        assets: publishedAssets(name, "https://example.invalid/current.zip"),
-      });
-      const download = () => {
-        downloads += 1;
-        return experimentalZip(gamePath);
-      };
-      const first = await ensureUe4ss(gamePath, {
-        showDialog: () => { throw new Error("asked"); },
-      }, { fetchRelease, download, cleanupDownload: true });
-      assert.equal(first.id, "current");
-      assert.equal(downloads, 1);
-      name = "UE4SS_v3.0.1-1184-gdeadbeef.zip";
-      const second = await ensureUe4ss(gamePath, {
-        showDialog: () => { throw new Error("asked"); },
-      }, { fetchRelease, download, cleanupDownload: true });
-      assert.equal(second.id, "current");
-      assert.equal(downloads, 2);
-    } finally {
-      clearPublishedBuild();
-      fs.rmSync(gamePath, { recursive: true, force: true });
-    }
-  });
-
-  it("reports an unrecognized build when the disk hashes differ from the published zip", async () => {
-    const { gamePath, win64 } = gameTree();
-    try {
-      writeCurrent(win64);
-      fs.writeFileSync(path.join(win64, "ue4ss", "UE4SS.dll"), BUILT.otherLoader);
-      const label = await readInstalledBuildLabel(gamePath, {
-        fetchRelease: async () => jsonResponse({
-          assets: publishedAssets("UE4SS_v3.0.1-1183-gcdbc0b66.zip", "https://example.invalid/current.zip"),
-        }),
-        download: () => experimentalZip(gamePath),
-      });
-      assert.equal(label, "unrecognized build");
-    } finally {
-      clearPublishedBuild();
-      fs.rmSync(gamePath, { recursive: true, force: true });
-    }
+    const version = productVersionInZip(zip1181);
+    assert.equal(/^\d+\.\d+\.\d+(\.\d+)?$/.test(version), false);
+    assert.equal(experimentalToken(version), null);
   });
 });

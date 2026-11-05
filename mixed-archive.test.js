@@ -17,6 +17,8 @@ const {
   testPak,
   testScripts,
   removeDeployed,
+  preserveModConfig,
+  restoreModConfig,
   dropModLine,
   listPakContainers,
   findPakConflicts,
@@ -347,6 +349,37 @@ describe("mixed archive", () => {
       assert.equal(fs.existsSync(path.join(paksDir, "OtherNote.txt")), false);
       assert.equal(fs.readFileSync(path.join(folder, "main.lua"), "utf8"), "keeper\r\n");
       assert.ok(fs.readFileSync(path.join(modsDir, "mods.txt"), "utf8").includes("WideClaim : 1"));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps config.lua when the mod folder is deleted and writes it back", () => {
+    const { root, modFolder } = scriptFixture("QuickStash");
+    try {
+      fs.mkdirSync(path.join(modFolder, "Scripts"), { recursive: true });
+      fs.writeFileSync(path.join(modFolder, "config.lua"), "root-cfg");
+      fs.writeFileSync(path.join(modFolder, "Scripts", "config.lua"), "script-cfg");
+      fs.writeFileSync(path.join(modFolder, "Scripts", "main.lua"), "return {}\r\n");
+      preserveModConfig(root, "QuickStash");
+      fs.rmSync(path.join(modFolder, "config.lua"));
+      preserveModConfig(root, "QuickStash");
+      const stash = path.join(root, "Binaries", "Win64", "ue4ss", "VortexSettings", "QuickStash");
+      assert.equal(fs.readFileSync(path.join(stash, "config.lua"), "utf8"), "root-cfg");
+
+      removeDeployed({ projectRoot: root, ue4ssModFolder: "QuickStash" });
+      assert.equal(fs.existsSync(modFolder), false);
+      assert.equal(fs.readFileSync(path.join(stash, "config.lua"), "utf8"), "root-cfg");
+      assert.equal(fs.readFileSync(path.join(stash, "Scripts", "config.lua"), "utf8"), "script-cfg");
+
+      fs.mkdirSync(path.join(modFolder, "Scripts"), { recursive: true });
+      fs.writeFileSync(path.join(modFolder, "config.lua"), "shipped");
+      fs.writeFileSync(path.join(modFolder, "Scripts", "config.lua"), "shipped-script");
+      assert.equal(restoreModConfig(root, "QuickStash"), true);
+      assert.equal(fs.readFileSync(path.join(modFolder, "config.lua"), "utf8"), "root-cfg");
+      assert.equal(fs.readFileSync(path.join(modFolder, "Scripts", "config.lua"), "utf8"), "script-cfg");
+      assert.equal(fs.existsSync(stash), false);
+      assert.equal(restoreModConfig(root, "QuickStash"), false);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

@@ -1,5 +1,13 @@
 # Permafrost Vortex Extension
 
+## 1.0.6
+
+- UE4SS setup leaves an experimental install alone. It reads the loader ProductVersion and the folder names under the game root. A dash plus a commit hash, or a version that is only a commit hash, is experimental. No question and no download.
+- A missing install, or a stable 3.0.1 install, asks once. Yes downloads the pinned zip `UE4SS_v3.0.1-1208-g6f8dc3cc` from the locked mirror and checks SHA-256 `899b6dbe84539c0b19d5ef08eb3a6e99e2195ebc0706baf24fe5799e3a6888f8` before writing. Built-in mod files are refreshed. `UE4SS-settings.ini`, `mods.txt`, `mods.json`, and `BPModLoaderMod\load_order.txt` stay when they already exist. A player mod folder stays. No on a missing install stops setup. No on a stable release keeps that release.
+- An unrecognized loader is left alone. A leftover `UE4SS.dll` beside an experimental install stays.
+- The UE4SS page shows the version it read and does not contact GitHub.
+- Disabling a mod, uninstalling it, or purging keeps `config.lua` and `Scripts\config.lua` in `ue4ss\VortexSettings\<ModName>` and writes them back the next time that mod deploys.
+
 ## 1.0.5
 
 - UE4SS setup reads the experimental-latest release and downloads the one zip whose name starts with `UE4SS_v3.0.1-`. The question and the UE4SS page name that build. `dwmapi.dll` and `ue4ss\UE4SS.dll` inside the zip are the current hashes for that run. A matching install is left alone. A different install gets the same question as before. A failed lookup, or a release that does not list exactly one of those zips, stops before the download and names the status or the files it found.

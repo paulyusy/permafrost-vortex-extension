@@ -3,6 +3,6 @@
   "gameId": 10550,
   "name": "Permafrost Vortex Extension",
   "author": "Paulyus",
-  "version": "1.0.5",
-  "description": "Installs the current UE4SS experimental 3.0.1 zip from the experimental-latest release, pak mods, and Permafrost ModLoader DLLs. A ModLoader DLL asks for the API only when the loader exe or host DLL is missing. PermafrostModLoader.exe is listed as Permafrost ModLoader API and pinned above Play when it is in the game folder. Setup offers a fix for a missing install, UE4SS 3.0.1, or another build. The UE4SS page reorders checked mods with arrows and a position menu. An installed pak keeps its name. A new mod that collides with it can be renamed to Name_01. Keep existing on a ModLoader ini conflict is remembered for that mod. An already deployed mod is not merged again while its stored ini is unchanged."
+  "version": "1.0.6",
+  "description": "Installs pinned UE4SS experimental 3.0.1-1208 when UE4SS is missing or still on stable 3.0.1. An experimental install is left alone. A mod's config.lua is kept across disable and purge. A ModLoader DLL asks for the API only when the loader exe or host DLL is missing. PermafrostModLoader.exe is listed as Permafrost ModLoader API and pinned above Play when it is in the game folder. The UE4SS page reorders checked mods with arrows and a position menu. An installed pak keeps its name. A new mod that collides with it can be renamed to Name_01. Keep existing on a ModLoader ini conflict is remembered for that mod. An already deployed mod is not merged again while its stored ini is unchanged."
 }
